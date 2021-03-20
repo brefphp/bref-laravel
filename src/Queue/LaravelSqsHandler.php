@@ -7,35 +7,28 @@ use Bref\Context\Context;
 use Bref\Event\Sqs\SqsEvent;
 use Bref\Event\Sqs\SqsHandler;
 use Illuminate\Container\Container;
-use Illuminate\Contracts\Debug\ExceptionHandler;
-use Illuminate\Contracts\Events\Dispatcher;
-use Illuminate\Queue\Events\JobExceptionOccurred;
-use Illuminate\Queue\Events\JobProcessed;
-use Illuminate\Queue\Events\JobProcessing;
-use Illuminate\Queue\Jobs\SqsJob;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\SqsQueue;
-use Throwable;
+use Illuminate\Queue\WorkerOptions;
 
 /**
  * SQS handler for AWS Lambda that integrates with Laravel Queue.
  */
 class LaravelSqsHandler extends SqsHandler
 {
-    /** @var Container */
+    /** @var Container $container */
     private $container;
+
     /** @var SqsClient */
     private $sqs;
-    /** @var Dispatcher */
-    private $events;
-    /** @var ExceptionHandler */
-    private $exceptions;
+
     /** @var string */
     private $connectionName;
+
     /** @var string */
     private $queue;
 
-    public function __construct(Container $container, Dispatcher $events, ExceptionHandler $exceptions, string $connection, string $queue)
+    public function __construct(Container $container, string $connection, string $queue)
     {
         $this->container = $container;
         $queueManager = $container->get('queue');
@@ -45,95 +38,71 @@ class LaravelSqsHandler extends SqsHandler
             throw new \RuntimeException("The '$connection' connection is not a SQS connection in the Laravel config");
         }
         $this->sqs = $queueConnector->getSqs();
-        $this->events = $events;
-        $this->exceptions = $exceptions;
         $this->connectionName = $connection;
         $this->queue = $queue;
     }
 
     public function handleSqs(SqsEvent $event, Context $context): void
     {
+        $worker = $this->container->makeWith(Worker::class, [
+            'isDownForMaintenance' => function () {
+                return false;
+            },
+        ]);
+
+        \assert($worker instanceof Worker);
+
         foreach ($event->getRecords() as $sqsRecord) {
-            $recordData = $sqsRecord->toArray();
-            $jobData = [
-                'MessageId' => $recordData['messageId'],
-                'ReceiptHandle' => $recordData['receiptHandle'],
-                'Attributes' => $recordData['attributes'],
-                'Body' => $recordData['body'],
-            ];
+            $message = $this->normalizeMessage($sqsRecord->toArray());
 
-            $job = new SqsJob(
-                $this->container,
-                $this->sqs,
-                $jobData,
+            $worker->runSqsJob(
+                $this->buildJob($message),
                 $this->connectionName,
-                $this->queue,
+                $this->getWorkerOptions()
             );
-
-            $this->process($this->connectionName, $job);
         }
     }
 
-    /**
-     * @see \Illuminate\Queue\Worker::process()
-     */
-    private function process(string $connectionName, SqsJob $job): void
+    protected function normalizeMessage(array $message): array
     {
-        try {
-            // First we will raise the before job event and determine if the job has already ran
-            // over its maximum attempt limits, which could primarily happen when this job is
-            // continually timing out and not actually throwing any exceptions from itself.
-            $this->raiseBeforeJobEvent($connectionName, $job);
+        return [
+            'MessageId' => $message['messageId'],
+            'ReceiptHandle' => $message['receiptHandle'],
+            'Body' => $message['body'],
+            'Attributes' => $message['attributes'],
+            'MessageAttributes' => $message['messageAttributes'],
+        ];
+    }
 
-            // Here we will fire off the job and let it process. We will catch any exceptions so
-            // they can be reported to the developers logs, etc. Once the job is finished the
-            // proper events will be fired to let any listeners know this job has finished.
-            $job->fire();
+    protected function buildJob(array $message): SqsJob
+    {
+        return new SqsJob(
+            $this->container,
+            $this->sqs,
+            $message,
+            $this->connectionName,
+            $this->queue,
+        );
+    }
 
-            $this->raiseAfterJobEvent($connectionName, $job);
-        } catch (Throwable $e) {
-            // Fire off an exception event
-            $this->raiseExceptionOccurredJobEvent($connectionName, $job, $e);
+    protected function getWorkerOptions(): WorkerOptions
+    {
+        $options = [
+            $backoff = 0,
+            $memory = 512,
+            $timeout = 0,
+            $sleep = 0,
+            $maxTries = 3,
+            $force = false,
+            $stopWhenEmpty = false,
+            $maxJobs = 0,
+            $maxTime = 0,
+        ];
 
-            // Report exception to defined log channel
-            $this->exceptions->report($e);
-
-            // Rethrow the exception to let SQS handle it
-            throw $e;
+        if (property_exists(WorkerOptions::class, 'name')) {
+            $options = array_merge(['default'], $options);
         }
-    }
 
-    /**
-     * @see \Illuminate\Queue\Worker::raiseBeforeJobEvent()
-     */
-    private function raiseBeforeJobEvent(string $connectionName, SqsJob $job): void
-    {
-        $this->events->dispatch(new JobProcessing(
-            $connectionName,
-            $job
-        ));
-    }
-
-    /**
-     * @see \Illuminate\Queue\Worker::raiseAfterJobEvent()
-     */
-    private function raiseAfterJobEvent(string $connectionName, SqsJob $job): void
-    {
-        $this->events->dispatch(new JobProcessed(
-            $connectionName,
-            $job
-        ));
-    }
-
-    /**
-     * @see \Illuminate\Queue\Worker::raiseExceptionOccurredJobEvent()
-     */
-    private function raiseExceptionOccurredJobEvent(string $connectionName, SqsJob $job, Throwable $e): void
-    {
-        $this->events->dispatch(new JobExceptionOccurred(
-            $connectionName,
-            $job,
-            $e
-        ));
+        return new WorkerOptions(...$options);
     }
 }
